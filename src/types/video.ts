@@ -1,0 +1,94 @@
+export interface VideoBookmark {
+  id: string;
+  timeSeconds: number;
+  label: string;
+  createdAt: number;
+}
+
+export interface VideoChapter {
+  timeSeconds: number;
+  label: string;
+}
+
+export interface VideoItem {
+  id: string;
+  videoId: string;
+  originalUrl: string;
+  title: string;
+  authorName: string;
+  authorUrl: string;
+  description: string;
+  durationSeconds: number | null;
+  collection: string;
+  addedAt: number;
+  lastWatchedAt: number | null;
+  lastPositionSeconds: number;
+  playbackRate: number;
+  bookmarks: VideoBookmark[];
+  chapters?: VideoChapter[];
+  notes: string;
+  thumbCached: boolean;
+  liked?: boolean;
+}
+
+export interface StorageBreakdown {
+  thumbnailsBytes: number;
+  thumbnailsCount: number;
+  metadataBytes: number;
+  notesAndBookmarksBytes: number;
+  settingsBytes: number;
+  otherBrowserBytes: number;
+  totalMeasuredBytes: number;
+}
+
+export interface StorageStats {
+  quotaBytes: number | null;
+  usageBytes: number | null;
+  videoCount: number;
+  cachedThumbsCount: number;
+  breakdown: StorageBreakdown;
+}
+
+export interface DataPreferences {
+  autoCacheThumbnails: boolean;
+  autoHarvestSuggested: boolean;
+  saveWatchProgress: boolean;
+  cacheChaptersAndNotesMeta: boolean;
+}
+
+export type AppView = 'home' | 'reels' | 'music' | 'player' | 'discover' | 'storage';
+
+export interface ActivePlayback {
+  source: 'stage' | 'inline' | 'music';
+  key: string;
+  token: number;
+}
+
+export interface SuggestedVideoInput {
+  videoId: string;
+  title?: string;
+  authorName?: string;
+  authorUrl?: string;
+  durationSeconds?: number | null;
+}
+
+export interface RelatedVideoItem {
+  videoId: string;
+  title: string;
+  authorName: string;
+  authorUrl: string;
+  durationText: string;
+  durationSeconds: number | null;
+  viewText: string;
+  watchUrl: string;
+}
+
+export interface ReelItem {
+  videoId: string;
+  title: string;
+  authorName: string;
+  viewText: string;
+  thumbnailUrl: string;
+  shortsUrl: string;
+}
+

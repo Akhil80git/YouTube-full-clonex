@@ -1,0 +1,1443 @@
+import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {
+  Disc3,
+  Headphones,
+  Heart,
+  Loader2,
+  Lock,
+  Moon,
+  Pause,
+  Play,
+  Repeat,
+  Repeat1,
+  Search,
+  Shuffle,
+  SkipBack,
+  SkipForward,
+  Unlock,
+  Volume2,
+  VolumeX,
+  WifiOff,
+  X,
+} from 'lucide-react';
+import {
+  createMediaNotificationAnchor,
+  type MediaNotificationAnchor,
+  updateMediaSession,
+} from '../lib/mediaSession';
+import {getThumbnailBlob} from '../lib/offlineDb';
+import {ensureYouTubeIframeApi} from '../lib/offlineMedia';
+import {formatDuration} from '../lib/youtube';
+import type {VideoItem} from '../types/video';
+import {CachedThumbnail} from './CachedThumbnail';
+
+interface YTMusicPlayer {
+  loadVideoById: (opts: string | {videoId: string; startSeconds?: number}) => void;
+  cueVideoById: (opts: string | {videoId: string; startSeconds?: number}) => void;
+  playVideo: () => void;
+  pauseVideo: () => void;
+  seekTo: (seconds: number, allowSeekAhead: boolean) => void;
+  getCurrentTime: () => number;
+  getDuration: () => number;
+  setPlaybackRate: (rate: number) => void;
+  mute: () => void;
+  unMute: () => void;
+  getPlayerState: () => number;
+  destroy: () => void;
+}
+
+export type MusicRepeatMode = 'all' | 'one' | 'off';
+
+export interface MusicController {
+  activeTrack: VideoItem | null;
+  isPlaying: boolean;
+  isBuffering: boolean;
+  currentTime: number;
+  duration: number;
+  isMuted: boolean;
+  playbackRate: number;
+  shuffle: boolean;
+  repeatMode: MusicRepeatMode;
+  errorMsg: string | null;
+  playTrack: (item: VideoItem) => void;
+  togglePlayPause: () => void;
+  playNext: () => void;
+  playPrev: () => void;
+  seekTo: (seconds: number) => void;
+  toggleMute: () => void;
+  changeSpeed: (rate: number) => void;
+  toggleShuffle: () => void;
+  cycleRepeat: () => void;
+  stopAndClear: () => void;
+}
+
+interface UseMusicAudioEngineOptions {
+  videos: VideoItem[];
+  isOnline: boolean;
+  pauseSignal: number;
+  onPlaybackStarted: () => void;
+}
+
+export function useMusicAudioEngine({
+  videos,
+  isOnline,
+  pauseSignal,
+  onPlaybackStarted,
+}: UseMusicAudioEngineOptions): {
+  audioHostRef: React.RefObject<HTMLDivElement | null>;
+  controller: MusicController;
+} {
+  const audioHostRef = useRef<HTMLDivElement | null>(null);
+  const playerRef = useRef<YTMusicPlayer | null>(null);
+  const readyRef = useRef(false);
+  const pendingTrackRef = useRef<{videoId: string; autoplay: boolean} | null>(null);
+  const loadedYtIdRef = useRef<string | null>(null);
+  const anchorRef = useRef<MediaNotificationAnchor | null>(null);
+  const playNextInternalRef = useRef<(fromEnded?: boolean) => void>(() => {});
+  const userPausedRef = useRef(false);
+
+  if (!anchorRef.current && typeof document !== 'undefined') {
+    anchorRef.current = createMediaNotificationAnchor();
+  }
+
+  const [activeTrackId, setActiveTrackId] = useState<string | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [shuffle, setShuffle] = useState(false);
+  const [repeatMode, setRepeatMode] = useState<MusicRepeatMode>('all');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const activeTrack = useMemo(
+    () => videos.find((v) => v.id === activeTrackId) ?? null,
+    [videos, activeTrackId]
+  );
+
+  const videosRef = useRef(videos);
+  videosRef.current = videos;
+  const activeTrackRef = useRef(activeTrack);
+  activeTrackRef.current = activeTrack;
+  const shuffleRef = useRef(shuffle);
+  shuffleRef.current = shuffle;
+  const repeatRef = useRef(repeatMode);
+  repeatRef.current = repeatMode;
+  const rateRef = useRef(playbackRate);
+  rateRef.current = playbackRate;
+  const isOnlineRef = useRef(isOnline);
+  isOnlineRef.current = isOnline;
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const durationRef = useRef(duration);
+  durationRef.current = duration;
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
+  const onPlaybackStartedRef = useRef(onPlaybackStarted);
+  onPlaybackStartedRef.current = onPlaybackStarted;
+
+  const mediaHandlersRef = useRef<{
+    onPlay: () => void;
+    onPause: () => void;
+    onNext: () => void;
+    onPrev: () => void;
+    onSeekTo: (sec: number) => void;
+    onSeekBy: (delta: number) => void;
+    onStop: () => void;
+  } | null>(null);
+
+  const loadAndPlayByItem = useCallback((item: VideoItem) => {
+    if (!isOnlineRef.current) {
+      setErrorMsg('Internet disconnected. Reconnect to play music tracks.');
+      return;
+    }
+    userPausedRef.current = false;
+    setErrorMsg(null);
+    setActiveTrackId(item.id);
+    setCurrentTime(0);
+    setDuration(item.durationSeconds || 0);
+    setIsBuffering(true);
+    onPlaybackStartedRef.current();
+
+    // Start top-level Media Notification anchor synchronously on user/next action
+    anchorRef.current?.start();
+    if (mediaHandlersRef.current) {
+      updateMediaSession(
+        item,
+        {
+          isPlaying: true,
+          duration: item.durationSeconds || 0,
+          currentTime: 0,
+          playbackRate: rateRef.current,
+        },
+        mediaHandlersRef.current,
+        true
+      );
+    }
+
+    if (playerRef.current && readyRef.current) {
+      try {
+        if (loadedYtIdRef.current === item.videoId) {
+          playerRef.current.playVideo();
+        } else {
+          loadedYtIdRef.current = item.videoId;
+          playerRef.current.loadVideoById({videoId: item.videoId, startSeconds: 0});
+          playerRef.current.setPlaybackRate(rateRef.current);
+          playerRef.current.playVideo();
+        }
+      } catch {
+        pendingTrackRef.current = {videoId: item.videoId, autoplay: true};
+      }
+    } else {
+      pendingTrackRef.current = {videoId: item.videoId, autoplay: true};
+    }
+  }, []);
+
+  const playNextInternal = useCallback(
+    (fromEnded = false) => {
+      const list = videosRef.current;
+      if (list.length === 0) return;
+
+      const cur = activeTrackRef.current;
+      if (fromEnded && repeatRef.current === 'one' && cur) {
+        if (playerRef.current && readyRef.current) {
+          playerRef.current.seekTo(0, true);
+          playerRef.current.playVideo();
+        }
+        return;
+      }
+
+      if (shuffleRef.current && list.length > 1) {
+        const candidates = list.filter((v) => v.id !== cur?.id);
+        const pick = candidates[Math.floor(Math.random() * candidates.length)] || list[0];
+        loadAndPlayByItem(pick);
+        return;
+      }
+
+      const idx = cur ? list.findIndex((v) => v.id === cur.id) : -1;
+      const nextIdx = idx + 1;
+      if (nextIdx < list.length) {
+        loadAndPlayByItem(list[nextIdx]);
+      } else if (repeatRef.current === 'all' || !fromEnded) {
+        loadAndPlayByItem(list[0]);
+      } else {
+        anchorRef.current?.pause();
+        setIsPlaying(false);
+      }
+    },
+    [loadAndPlayByItem]
+  );
+
+  playNextInternalRef.current = playNextInternal;
+
+  // Pre-warm a single persistent YouTube IFrame audio engine so switching tracks has ZERO iframe mount lag
+  useEffect(() => {
+    if (!isOnline || videos.length === 0) return;
+    if (playerRef.current) return;
+
+    let cancelled = false;
+    const initialVideoId = videos[0]?.videoId;
+    if (!initialVideoId) return;
+
+    const mountWarmPlayer = () => {
+      if (cancelled || !audioHostRef.current || !window.YT?.Player || playerRef.current) return;
+
+      audioHostRef.current.innerHTML = '';
+      const node = document.createElement('div');
+      node.style.width = '100%';
+      node.style.height = '100%';
+      audioHostRef.current.appendChild(node);
+
+      loadedYtIdRef.current = initialVideoId;
+
+      playerRef.current = new (window.YT.Player as unknown as new (
+        el: HTMLElement,
+        opts: Record<string, unknown>
+      ) => YTMusicPlayer)(node, {
+        videoId: initialVideoId,
+        width: '200',
+        height: '200',
+        playerVars: {
+          autoplay: 0,
+          controls: 0,
+          rel: 0,
+          modestbranding: 1,
+          playsinline: 1,
+          origin: window.location.origin,
+        },
+        events: {
+          onReady: (ev: {target: YTMusicPlayer}) => {
+            if (cancelled) return;
+            readyRef.current = true;
+            const pending = pendingTrackRef.current;
+            if (pending) {
+              pendingTrackRef.current = null;
+              try {
+                if (loadedYtIdRef.current !== pending.videoId) {
+                  loadedYtIdRef.current = pending.videoId;
+                  ev.target.loadVideoById({videoId: pending.videoId, startSeconds: 0});
+                }
+                ev.target.setPlaybackRate(rateRef.current);
+                if (pending.autoplay) ev.target.playVideo();
+              } catch {
+                // Ignore
+              }
+            }
+          },
+          onStateChange: (ev: {data: number; target: YTMusicPlayer}) => {
+            if (cancelled) return;
+            const st = ev.data;
+            if (st === 1) {
+              anchorRef.current?.start();
+              setIsPlaying(true);
+              setIsBuffering(false);
+              setErrorMsg(null);
+              const d = ev.target.getDuration();
+              if (d > 0) setDuration(d);
+              onPlaybackStartedRef.current();
+            } else if (st === 2) {
+              // If user did NOT explicitly pause while backgrounded/locked, try auto-resume right away
+              if (
+                document.visibilityState === 'hidden' &&
+                !userPausedRef.current &&
+                activeTrackRef.current
+              ) {
+                setTimeout(() => {
+                  if (!userPausedRef.current && playerRef.current && readyRef.current) {
+                    try {
+                      playerRef.current.playVideo();
+                    } catch {
+                      // Ignore
+                    }
+                  }
+                }, 140);
+                return;
+              }
+              anchorRef.current?.pause();
+              setIsPlaying(false);
+              setIsBuffering(false);
+            } else if (st === 3) {
+              setIsBuffering(true);
+            } else if (st === 0) {
+              setIsBuffering(false);
+              playNextInternalRef.current(true);
+            }
+          },
+          onError: (ev: {data: number}) => {
+            if (cancelled) return;
+            setIsBuffering(false);
+            setIsPlaying(false);
+            if (ev.data === 101 || ev.data === 150) {
+              setErrorMsg('Audio embed blocked by owner — skipping to next track...');
+              setTimeout(() => playNextInternalRef.current(false), 900);
+            } else {
+              setErrorMsg('Track unavailable — skipping...');
+              setTimeout(() => playNextInternalRef.current(false), 900);
+            }
+          },
+        },
+      });
+    };
+
+    void ensureYouTubeIframeApi().then(() => {
+      mountWarmPlayer();
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isOnline, videos]);
+
+  // Cleanup players & notification anchor on unmount
+  useEffect(() => {
+    return () => {
+      readyRef.current = false;
+      anchorRef.current?.destroy();
+      anchorRef.current = null;
+      if (playerRef.current) {
+        try {
+          playerRef.current.destroy();
+        } catch {
+          // Ignore
+        }
+        playerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Global Single-Playback Lock: pause audio engine immediately when another video plays
+  useEffect(() => {
+    if (pauseSignal === 0) return;
+    userPausedRef.current = true;
+    anchorRef.current?.pause();
+    if (playerRef.current && readyRef.current) {
+      try {
+        playerRef.current.pauseVideo();
+      } catch {
+        // Ignore
+      }
+    }
+    setIsPlaying(false);
+    setIsBuffering(false);
+  }, [pauseSignal]);
+
+  // Poll YouTube audio playback progress
+  useEffect(() => {
+    if (!activeTrackId || !isPlaying) return;
+    const interval = setInterval(() => {
+      if (!playerRef.current || !readyRef.current) return;
+      try {
+        const t = playerRef.current.getCurrentTime();
+        const d = playerRef.current.getDuration();
+        if (Number.isFinite(t)) setCurrentTime(t);
+        if (Number.isFinite(d) && d > 0) setDuration(d);
+      } catch {
+        // Ignore
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, [activeTrackId, isPlaying]);
+
+  const playTrack = useCallback(
+    (item: VideoItem) => {
+      if (!isOnlineRef.current) {
+        setErrorMsg('Connect to the internet to play music audio.');
+        return;
+      }
+      userPausedRef.current = false;
+      if (activeTrackRef.current?.id === item.id && playerRef.current && readyRef.current) {
+        try {
+          const st = playerRef.current.getPlayerState();
+          if (st === 1) {
+            userPausedRef.current = true;
+            anchorRef.current?.pause();
+            playerRef.current.pauseVideo();
+            setIsPlaying(false);
+          } else {
+            anchorRef.current?.start();
+            onPlaybackStartedRef.current();
+            playerRef.current.playVideo();
+            setIsPlaying(true);
+          }
+          return;
+        } catch {
+          // Fall through to full load
+        }
+      }
+      loadAndPlayByItem(item);
+    },
+    [loadAndPlayByItem]
+  );
+
+  const togglePlayPause = useCallback(() => {
+    const list = videosRef.current;
+    if (!activeTrackRef.current) {
+      userPausedRef.current = false;
+      if (list[0]) loadAndPlayByItem(list[0]);
+      return;
+    }
+    if (!playerRef.current || !readyRef.current) return;
+    try {
+      const st = playerRef.current.getPlayerState();
+      if (st === 1) {
+        userPausedRef.current = true;
+        anchorRef.current?.pause();
+        playerRef.current.pauseVideo();
+        setIsPlaying(false);
+      } else {
+        userPausedRef.current = false;
+        anchorRef.current?.start();
+        onPlaybackStartedRef.current();
+        playerRef.current.playVideo();
+        setIsPlaying(true);
+      }
+    } catch {
+      // Ignore
+    }
+  }, [loadAndPlayByItem]);
+
+  const playNext = useCallback(() => playNextInternal(false), [playNextInternal]);
+
+  const playPrev = useCallback(() => {
+    const list = videosRef.current;
+    if (list.length === 0) return;
+    if (currentTimeRef.current > 4 && playerRef.current && readyRef.current) {
+      playerRef.current.seekTo(0, true);
+      setCurrentTime(0);
+      return;
+    }
+    const cur = activeTrackRef.current;
+    const idx = cur ? list.findIndex((v) => v.id === cur.id) : 0;
+    const prevIdx = idx <= 0 ? list.length - 1 : idx - 1;
+    loadAndPlayByItem(list[prevIdx]);
+  }, [loadAndPlayByItem]);
+
+  const seekTo = useCallback((seconds: number) => {
+    const clamped = Math.max(0, seconds);
+    setCurrentTime(clamped);
+    if (playerRef.current && readyRef.current) {
+      try {
+        playerRef.current.seekTo(clamped, true);
+      } catch {
+        // Ignore
+      }
+    }
+  }, []);
+
+  const toggleMute = useCallback(() => {
+    if (!playerRef.current || !readyRef.current) return;
+    try {
+      if (isMuted) {
+        playerRef.current.unMute();
+        setIsMuted(false);
+      } else {
+        playerRef.current.mute();
+        setIsMuted(true);
+      }
+    } catch {
+      // Ignore
+    }
+  }, [isMuted]);
+
+  const changeSpeed = useCallback((rate: number) => {
+    setPlaybackRate(rate);
+    if (playerRef.current && readyRef.current) {
+      try {
+        playerRef.current.setPlaybackRate(rate);
+      } catch {
+        // Ignore
+      }
+    }
+  }, []);
+
+  const toggleShuffle = useCallback(() => setShuffle((s) => !s), []);
+  const cycleRepeat = useCallback(
+    () => setRepeatMode((m) => (m === 'all' ? 'one' : m === 'one' ? 'off' : 'all')),
+    []
+  );
+
+  const stopAndClear = useCallback(() => {
+    userPausedRef.current = true;
+    anchorRef.current?.stop();
+    if (playerRef.current && readyRef.current) {
+      try {
+        playerRef.current.pauseVideo();
+      } catch {
+        // Ignore
+      }
+    }
+    setIsPlaying(false);
+    setIsBuffering(false);
+    setActiveTrackId(null);
+    setCurrentTime(0);
+  }, []);
+
+  // Build stable callback handlers object for Lock Screen & OS Notification Controls
+  const mediaHandlers = useMemo(
+    () => ({
+      onPlay: () => {
+        userPausedRef.current = false;
+        anchorRef.current?.start();
+        onPlaybackStartedRef.current();
+        playerRef.current?.playVideo();
+        setIsPlaying(true);
+        if (activeTrackRef.current && mediaHandlersRef.current) {
+          updateMediaSession(
+            activeTrackRef.current,
+            {
+              isPlaying: true,
+              duration: durationRef.current,
+              currentTime: currentTimeRef.current,
+              playbackRate: rateRef.current,
+            },
+            mediaHandlersRef.current,
+            true
+          );
+        }
+      },
+      onPause: () => {
+        userPausedRef.current = true;
+        anchorRef.current?.pause();
+        playerRef.current?.pauseVideo();
+        setIsPlaying(false);
+        if (activeTrackRef.current && mediaHandlersRef.current) {
+          updateMediaSession(
+            activeTrackRef.current,
+            {
+              isPlaying: false,
+              duration: durationRef.current,
+              currentTime: currentTimeRef.current,
+              playbackRate: rateRef.current,
+            },
+            mediaHandlersRef.current,
+            true
+          );
+        }
+      },
+      onNext: () => playNextInternal(false),
+      onPrev: () => playPrev(),
+      onSeekTo: (sec: number) => seekTo(sec),
+      onSeekBy: (delta: number) => seekTo(Math.max(0, currentTimeRef.current + delta)),
+      onStop: () => stopAndClear(),
+    }),
+    [playNextInternal, playPrev, seekTo, stopAndClear]
+  );
+  mediaHandlersRef.current = mediaHandlers;
+
+  // Sync Media Session continuously when active track, play state, or timeline changes
+  useEffect(() => {
+    if (!activeTrack) {
+      updateMediaSession(null, {isPlaying: false, duration: 0, currentTime: 0, playbackRate: 1}, mediaHandlers);
+      return;
+    }
+    updateMediaSession(
+      activeTrack,
+      {
+        isPlaying,
+        duration,
+        currentTime,
+        playbackRate,
+      },
+      mediaHandlers
+    );
+  }, [activeTrack, isPlaying, duration, currentTime, playbackRate, mediaHandlers]);
+
+  // Background Continuity Guard: keep OS notification + audio alive across lockscreen & switching to other apps
+  useEffect(() => {
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+
+    const clearTimers = () => {
+      while (timers.length > 0) {
+        const t = timers.pop();
+        if (t) clearTimeout(t);
+      }
+    };
+
+    const reassertPlaybackAndNotification = () => {
+      const p = playerRef.current;
+      const track = activeTrackRef.current;
+      if (!track || userPausedRef.current) return;
+      anchorRef.current?.start();
+      updateMediaSession(
+        track,
+        {
+          isPlaying: true,
+          duration: durationRef.current,
+          currentTime: currentTimeRef.current,
+          playbackRate: rateRef.current,
+        },
+        mediaHandlers,
+        true
+      );
+      if (p && readyRef.current) {
+        try {
+          if (p.getPlayerState() !== 1) {
+            p.playVideo();
+          }
+        } catch {
+          // Ignore OS background block
+        }
+      }
+    };
+
+    const handleVisibility = () => {
+      clearTimers();
+      if (document.visibilityState === 'hidden') {
+        if (isPlayingRef.current && !userPausedRef.current) {
+          anchorRef.current?.start();
+          timers.push(setTimeout(reassertPlaybackAndNotification, 160));
+          timers.push(setTimeout(reassertPlaybackAndNotification, 550));
+          timers.push(setTimeout(reassertPlaybackAndNotification, 1200));
+        }
+      } else if (document.visibilityState === 'visible') {
+        const p = playerRef.current;
+        if (p && readyRef.current) {
+          try {
+            const st = p.getPlayerState();
+            const playingNow = st === 1;
+            setIsPlaying(playingNow);
+            if (activeTrackRef.current) {
+              updateMediaSession(
+                activeTrackRef.current,
+                {
+                  isPlaying: playingNow,
+                  duration: durationRef.current,
+                  currentTime: currentTimeRef.current,
+                  playbackRate: rateRef.current,
+                },
+                mediaHandlers,
+                true
+              );
+            }
+          } catch {
+            // Ignore
+          }
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      clearTimers();
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [mediaHandlers]);
+
+  return {
+    audioHostRef,
+    controller: {
+      activeTrack,
+      isPlaying,
+      isBuffering,
+      currentTime,
+      duration,
+      isMuted,
+      playbackRate,
+      shuffle,
+      repeatMode,
+      errorMsg,
+      playTrack,
+      togglePlayPause,
+      playNext,
+      playPrev,
+      seekTo,
+      toggleMute,
+      changeSpeed,
+      toggleShuffle,
+      cycleRepeat,
+      stopAndClear,
+    },
+  };
+}
+
+interface MusicPlayerViewProps {
+  videos: VideoItem[];
+  collections: string[];
+  isOnline: boolean;
+  controller: MusicController;
+  externalSearchQuery?: string;
+  onToggleLike?: (video: VideoItem) => void;
+}
+
+export const MusicPlayerView: React.FC<MusicPlayerViewProps> = ({
+  videos,
+  collections,
+  isOnline,
+  controller,
+  externalSearchQuery = '',
+  onToggleLike,
+}) => {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [activeCollection, setActiveCollection] = useState('All');
+  const [likedOnly, setLikedOnly] = useState(false);
+  const [glowUrl, setGlowUrl] = useState<string | null>(null);
+  const [pocketMode, setPocketMode] = useState(false);
+  const [wakeLockActive, setWakeLockActive] = useState(false);
+  const [lastBlackTapAt, setLastBlackTapAt] = useState(0);
+  const [unlockHint, setUnlockHint] = useState(false);
+  const scrubberRef = useRef<HTMLDivElement | null>(null);
+
+  const effectiveSearch = (externalSearchQuery || searchQuery).trim().toLowerCase();
+
+  const displayTrack = controller.activeTrack ?? videos[0] ?? null;
+
+  // Screen Wake Lock while AMOLED Pocket Mode is active so audio keeps playing nonstop
+  useEffect(() => {
+    if (!pocketMode) {
+      setWakeLockActive(false);
+      return;
+    }
+
+    let sentinel: {release: () => Promise<void>} | null = null;
+    let cancelled = false;
+
+    const acquireWakeLock = async () => {
+      try {
+        const nav = navigator as Navigator & {
+          wakeLock?: {request: (type: 'screen') => Promise<{release: () => Promise<void>}>};
+        };
+        if (nav.wakeLock?.request && document.visibilityState === 'visible') {
+          sentinel = await nav.wakeLock.request('screen');
+          if (!cancelled) setWakeLockActive(true);
+        }
+      } catch {
+        if (!cancelled) setWakeLockActive(false);
+      }
+    };
+
+    acquireWakeLock();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') acquireWakeLock();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', handleVisibility);
+      sentinel?.release().catch(() => {});
+      setWakeLockActive(false);
+    };
+  }, [pocketMode]);
+
+  useEffect(() => {
+    if (!displayTrack) {
+      setGlowUrl(null);
+      return;
+    }
+    let active = true;
+    let url: string | null = null;
+    getThumbnailBlob(displayTrack.videoId).then((blob) => {
+      if (blob && active) {
+        url = URL.createObjectURL(blob);
+        setGlowUrl(url);
+      } else if (active) {
+        setGlowUrl(null);
+      }
+    });
+    return () => {
+      active = false;
+      if (url) URL.revokeObjectURL(url);
+    };
+  }, [displayTrack?.videoId]);
+
+  const filtered = useMemo(() => {
+    return videos.filter((v) => {
+      if (likedOnly && !v.liked) return false;
+      if (activeCollection !== 'All' && v.collection !== activeCollection) return false;
+      if (effectiveSearch) {
+        const hay = `${v.title} ${v.authorName} ${v.collection}`.toLowerCase();
+        if (!hay.includes(effectiveSearch)) return false;
+      }
+      return true;
+    });
+  }, [videos, effectiveSearch, activeCollection, likedOnly]);
+
+  const progressPct =
+    controller.duration > 0
+      ? Math.min(100, (controller.currentTime / controller.duration) * 100)
+      : 0;
+
+  function handleSeekClick(e: React.MouseEvent<HTMLDivElement>) {
+    if (!scrubberRef.current || controller.duration <= 0) return;
+    const rect = scrubberRef.current.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    controller.seekTo(ratio * controller.duration);
+  }
+
+  function handlePocketSurfaceTap() {
+    const now = Date.now();
+    if (now - lastBlackTapAt < 420) {
+      setPocketMode(false);
+      setUnlockHint(false);
+    } else {
+      setLastBlackTapAt(now);
+      setUnlockHint(true);
+      setTimeout(() => setUnlockHint(false), 1800);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900 dark:text-white flex items-center gap-2.5">
+            <Headphones className="w-6 h-6 text-rose-500" />
+            <span>Music Audio Mode</span>
+          </h1>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+            Sound-only music playback with Lock Screen &amp; Notification Bar controls + Pocket Black Screen.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2.5">
+          <button
+            type="button"
+            onClick={() => {
+              if (!controller.activeTrack && displayTrack) {
+                controller.playTrack(displayTrack);
+              }
+              setPocketMode(true);
+            }}
+            title="Turn screen pitch black & lock touches while song keeps playing in pocket"
+            className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 dark:border-[#242A38] bg-white dark:bg-[#13161D] hover:border-rose-500/60 text-xs font-semibold text-slate-800 dark:text-white inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <Moon className="w-3.5 h-3.5 text-rose-500" />
+            <span>Pocket Black Screen</span>
+          </button>
+
+          <span className="font-mono text-xs tabular-nums text-slate-500 dark:text-slate-400">
+            {videos.length} tracks
+          </span>
+        </div>
+      </div>
+
+      {!isOnline && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-600 dark:text-amber-400 flex items-center gap-2">
+          <WifiOff className="w-4 h-4 shrink-0" />
+          <span>Internet disconnected. Reconnect to play tracks from YouTube.</span>
+        </div>
+      )}
+
+      {videos.length === 0 ? (
+        <div className="rounded-2xl border border-slate-200 dark:border-[#1E2430] bg-white dark:bg-[#13161D] p-12 text-center space-y-2">
+          <h2 className="text-lg font-semibold text-slate-900 dark:text-white">
+            Thanks for visiting Music Mode!
+          </h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+            Search any song, artist, or playlist in the search bar above, or tap <strong>+</strong> to add tracks to play here.
+          </p>
+        </div>
+      ) : (
+        <>
+          {/* Audio-Only Hero Player Deck */}
+          {displayTrack && (
+            <div className="relative overflow-hidden rounded-3xl border border-slate-200 dark:border-[#1E2430] bg-white dark:bg-[#13161D] p-5 sm:p-7 shadow-xl">
+              {glowUrl && (
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-0 opacity-20 dark:opacity-30 blur-3xl scale-110"
+                  style={{
+                    backgroundImage: `url(${glowUrl})`,
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center',
+                  }}
+                />
+              )}
+
+              <div className="relative z-10 flex flex-col md:flex-row md:items-center gap-6">
+                {/* Clean Full-Fit Cover Thumbnail (no video iframe shown) */}
+                <div className="relative w-full md:w-56 aspect-video rounded-2xl overflow-hidden bg-black border border-white/10 shadow-lg shrink-0">
+                  <CachedThumbnail
+                    videoId={displayTrack.videoId}
+                    alt={displayTrack.title}
+                    isOnline={isOnline}
+                    fit="contain"
+                    className="w-full h-full"
+                  />
+                  {controller.isPlaying && (
+                    <div className="absolute bottom-2 left-2 rounded-md bg-black/80 px-2 py-1 inline-flex items-center gap-1.5 text-[10px] font-mono text-rose-400">
+                      <Disc3 className="w-3 h-3 animate-spin" />
+                      <span>AUDIO ON</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="min-w-0 flex-1 space-y-4">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-rose-500">
+                      <span>
+                        {controller.activeTrack
+                          ? controller.isBuffering
+                            ? 'Starting Audio...'
+                            : controller.isPlaying
+                              ? 'Now Playing Audio'
+                              : 'Paused'
+                          : 'Ready to Play'}
+                      </span>
+                      {controller.activeTrack && (
+                        <span className="text-[10px] font-mono normal-case text-emerald-600 dark:text-emerald-400">
+                          · Notification &amp; Lock Screen Active
+                        </span>
+                      )}
+                    </div>
+                    <h2 className="mt-1 text-lg sm:text-xl font-bold text-slate-900 dark:text-white line-clamp-2 leading-snug">
+                      {displayTrack.title}
+                    </h2>
+                    <div className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                      {displayTrack.authorName} · {displayTrack.collection}
+                    </div>
+                  </div>
+
+                  {controller.errorMsg && (
+                    <p className="text-xs font-medium text-amber-500">{controller.errorMsg}</p>
+                  )}
+
+                  {/* Scrubber Bar */}
+                  <div className="space-y-1.5">
+                    <div
+                      ref={scrubberRef}
+                      onClick={handleSeekClick}
+                      role="slider"
+                      aria-label="Audio seek bar"
+                      aria-valuemin={0}
+                      aria-valuemax={Math.floor(controller.duration)}
+                      aria-valuenow={Math.floor(controller.currentTime)}
+                      tabIndex={0}
+                      className="h-4 flex items-center cursor-pointer group"
+                    >
+                      <div className="w-full h-1.5 group-hover:h-2 transition-all rounded-full bg-slate-200 dark:bg-white/15 overflow-hidden">
+                        <div
+                          className="h-full bg-rose-600 rounded-full transition-[width] duration-150"
+                          style={{width: `${progressPct}%`}}
+                        />
+                      </div>
+                    </div>
+                    <div className="flex justify-between font-mono text-[11px] text-slate-500 dark:text-slate-400 tabular-nums">
+                      <span>{formatDuration(controller.currentTime)}</span>
+                      <span>
+                        {formatDuration(controller.duration || displayTrack.durationSeconds || 0)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Audio Deck Controls */}
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={controller.toggleShuffle}
+                        title="Shuffle"
+                        aria-label="Toggle shuffle"
+                        className={`min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl border transition-colors cursor-pointer ${
+                          controller.shuffle
+                            ? 'border-rose-500/50 bg-rose-600/15 text-rose-500'
+                            : 'border-slate-200 dark:border-[#242A38] text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#1C212C]'
+                        }`}
+                      >
+                        <Shuffle className="w-4 h-4" />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={controller.playPrev}
+                        aria-label="Previous track"
+                        className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-[#242A38] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1C212C] cursor-pointer"
+                      >
+                        <SkipBack className="w-4 h-4" />
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={!isOnline}
+                        onClick={() => {
+                          if (!controller.activeTrack && displayTrack) {
+                            controller.playTrack(displayTrack);
+                          } else {
+                            controller.togglePlayPause();
+                          }
+                        }}
+                        aria-label={controller.isPlaying ? 'Pause music' : 'Play music'}
+                        className="min-h-[44px] px-5 rounded-xl bg-rose-600 hover:bg-rose-700 disabled:opacity-40 text-white font-semibold text-xs inline-flex items-center gap-2 shadow-lg shadow-rose-600/25 cursor-pointer"
+                      >
+                        {controller.isBuffering ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : controller.isPlaying ? (
+                          <Pause className="w-4 h-4 fill-current" />
+                        ) : (
+                          <Play className="w-4 h-4 fill-current" />
+                        )}
+                        <span>{controller.isPlaying ? 'Pause' : 'Play Audio'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={controller.playNext}
+                        aria-label="Next track"
+                        className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-[#242A38] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1C212C] cursor-pointer"
+                      >
+                        <SkipForward className="w-4 h-4" />
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={controller.cycleRepeat}
+                        title={`Repeat: ${controller.repeatMode}`}
+                        aria-label={`Repeat mode ${controller.repeatMode}`}
+                        className={`min-h-[40px] min-w-[40px] flex items-center justify-center rounded-xl border transition-colors cursor-pointer ${
+                          controller.repeatMode !== 'off'
+                            ? 'border-rose-500/50 bg-rose-600/15 text-rose-500'
+                            : 'border-slate-200 dark:border-[#242A38] text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#1C212C]'
+                        }`}
+                      >
+                        {controller.repeatMode === 'one' ? (
+                          <Repeat1 className="w-4 h-4" />
+                        ) : (
+                          <Repeat className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      {onToggleLike && (
+                        <button
+                          type="button"
+                          onClick={() => onToggleLike(displayTrack)}
+                          aria-label={displayTrack.liked ? 'Unlike track' : 'Like track'}
+                          className={`min-h-[38px] px-3 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                            displayTrack.liked
+                              ? 'border-rose-500/50 bg-rose-600/15 text-rose-500'
+                              : 'border-slate-200 dark:border-[#242A38] text-slate-600 dark:text-slate-300 hover:text-rose-500'
+                          }`}
+                        >
+                          <Heart className={`w-3.5 h-3.5 ${displayTrack.liked ? 'fill-current' : ''}`} />
+                          <span>{displayTrack.liked ? 'Liked' : 'Like'}</span>
+                        </button>
+                      )}
+
+                      <select
+                        aria-label="Audio speed"
+                        value={controller.playbackRate}
+                        onChange={(e) => controller.changeSpeed(Number(e.target.value))}
+                        className="min-h-[38px] rounded-xl border border-slate-200 dark:border-[#242A38] bg-slate-50 dark:bg-[#0B0D11] px-2.5 font-mono text-xs text-slate-800 dark:text-slate-200 cursor-pointer"
+                      >
+                        {[0.75, 1, 1.25, 1.5, 2].map((r) => (
+                          <option key={r} value={r}>
+                            {r}x
+                          </option>
+                        ))}
+                      </select>
+
+                      <button
+                        type="button"
+                        onClick={controller.toggleMute}
+                        aria-label={controller.isMuted ? 'Unmute audio' : 'Mute audio'}
+                        className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-xl border border-slate-200 dark:border-[#242A38] text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1C212C] cursor-pointer"
+                      >
+                        {controller.isMuted ? (
+                          <VolumeX className="w-4 h-4" />
+                        ) : (
+                          <Volume2 className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Filter & Search Tracklist */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            {!externalSearchQuery && (
+              <div className="relative flex-1 min-w-[200px] max-w-md">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="search"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search any song or video track..."
+                  className="w-full min-h-[40px] rounded-xl border border-slate-200 dark:border-[#1E2430] bg-white dark:bg-[#13161D] pl-10 pr-4 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-rose-600/50"
+                />
+              </div>
+            )}
+
+            <div className="flex items-center gap-2 ml-auto">
+              <button
+                type="button"
+                onClick={() => setLikedOnly((v) => !v)}
+                className={`min-h-[40px] px-3 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer ${
+                  likedOnly
+                    ? 'border-rose-500/50 bg-rose-600/15 text-rose-500'
+                    : 'border-slate-200 dark:border-[#1E2430] bg-white dark:bg-[#13161D] text-slate-600 dark:text-slate-300'
+                }`}
+              >
+                <Heart className={`w-3.5 h-3.5 ${likedOnly ? 'fill-current' : ''}`} />
+                <span>Liked Only</span>
+              </button>
+
+              <select
+                aria-label="Filter music by collection"
+                value={activeCollection}
+                onChange={(e) => setActiveCollection(e.target.value)}
+                className="min-h-[40px] rounded-xl border border-slate-200 dark:border-[#1E2430] bg-white dark:bg-[#13161D] px-3 text-xs font-medium text-slate-700 dark:text-slate-200 cursor-pointer"
+              >
+                {['All', ...collections].map((col) => (
+                  <option key={col} value={col}>
+                    {col}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* All-Videos Audio Tracklist: click anywhere on any item -> instant sound! */}
+          {filtered.length === 0 ? (
+            <div className="rounded-2xl border border-slate-200 dark:border-[#1E2430] bg-white dark:bg-[#13161D] p-10 text-center space-y-3">
+              <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                No matching tracks in this filter.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery('');
+                  setActiveCollection('All');
+                  setLikedOnly(false);
+                }}
+                className="min-h-[36px] px-4 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold cursor-pointer"
+              >
+                Show All Tracks ({videos.length})
+              </button>
+            </div>
+          ) : (
+            <div className="rounded-2xl border border-slate-200 dark:border-[#1E2430] bg-white dark:bg-[#13161D] divide-y divide-slate-100 dark:divide-[#1E2430] overflow-hidden">
+              {filtered.map((item, idx) => {
+                const isCurrent = controller.activeTrack?.id === item.id;
+                const isCurrentPlaying = isCurrent && controller.isPlaying;
+                return (
+                  <div
+                    key={item.id}
+                    onClick={() => controller.playTrack(item)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        controller.playTrack(item);
+                      }
+                    }}
+                    className={`w-full px-4 py-3 flex items-center gap-3.5 text-left transition-colors cursor-pointer ${
+                      isCurrent
+                        ? 'bg-rose-600/[0.08] dark:bg-rose-500/[0.10]'
+                        : 'hover:bg-slate-50 dark:hover:bg-[#171B24]'
+                    }`}
+                  >
+                    <div className="w-6 text-center font-mono text-xs tabular-nums shrink-0 text-slate-400">
+                      {isCurrent && controller.isBuffering ? (
+                        <Loader2 className="w-4 h-4 text-rose-500 animate-spin mx-auto" />
+                      ) : isCurrentPlaying ? (
+                        <Pause className="w-4 h-4 text-rose-500 mx-auto fill-current" />
+                      ) : (
+                        <span>{idx + 1}</span>
+                      )}
+                    </div>
+
+                    <div className="relative w-16 aspect-video rounded-lg overflow-hidden bg-black shrink-0">
+                      <CachedThumbnail
+                        videoId={item.videoId}
+                        alt={item.title}
+                        isOnline={isOnline}
+                        fit="contain"
+                        className="w-full h-full"
+                      />
+                    </div>
+
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className={`text-sm font-semibold truncate ${
+                          isCurrent
+                            ? 'text-rose-600 dark:text-rose-400'
+                            : 'text-slate-900 dark:text-white'
+                        }`}
+                      >
+                        {item.title}
+                      </div>
+                      <div className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400 truncate">
+                        <span className="truncate">{item.authorName}</span>
+                        <span aria-hidden="true">·</span>
+                        <span>{item.collection}</span>
+                      </div>
+                    </div>
+
+                    {onToggleLike && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleLike(item);
+                        }}
+                        aria-label={item.liked ? `Unlike ${item.title}` : `Like ${item.title}`}
+                        className={`min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg transition-colors cursor-pointer shrink-0 ${
+                          item.liked
+                            ? 'text-rose-500 bg-rose-500/10'
+                            : 'text-slate-400 hover:text-rose-500'
+                        }`}
+                      >
+                        <Heart className={`w-4 h-4 ${item.liked ? 'fill-current' : ''}`} />
+                      </button>
+                    )}
+
+                    <div className="font-mono text-xs text-slate-500 dark:text-slate-400 tabular-nums shrink-0">
+                      {item.durationSeconds ? formatDuration(item.durationSeconds) : '—'}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* AMOLED Pitch-Black Pocket Mode Overlay */}
+      {pocketMode && (
+        <div
+          onClick={handlePocketSurfaceTap}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Pocket black screen music mode"
+          className="fixed inset-0 z-50 bg-black text-white flex flex-col items-center justify-between p-6 select-none cursor-pointer"
+        >
+          <div className="w-full flex items-center justify-between text-[11px] font-mono text-white/35">
+            <span className="inline-flex items-center gap-1.5">
+              <Lock className="w-3.5 h-3.5" />
+              <span>AMOLED Pocket Mode {wakeLockActive ? '· Screen Awake' : ''}</span>
+            </span>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setPocketMode(false);
+              }}
+              className="px-3 py-1.5 rounded-lg border border-white/15 text-white/60 hover:text-white inline-flex items-center gap-1.5 cursor-pointer"
+            >
+              <Unlock className="w-3.5 h-3.5" />
+              <span>Unlock</span>
+            </button>
+          </div>
+
+          <div className="max-w-sm w-full text-center space-y-5">
+            {displayTrack && (
+              <>
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-mono uppercase tracking-widest text-rose-500/75">
+                    {controller.isPlaying ? 'Playing Audio' : 'Paused'}
+                  </div>
+                  <h2 className="text-base font-semibold text-white/75 line-clamp-2">
+                    {displayTrack.title}
+                  </h2>
+                  <p className="text-xs text-white/35">{displayTrack.authorName}</p>
+                </div>
+
+                <div className="font-mono text-xs text-white/40 tabular-nums">
+                  {formatDuration(controller.currentTime)} /{' '}
+                  {formatDuration(controller.duration || displayTrack.durationSeconds || 0)}
+                </div>
+              </>
+            )}
+
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="flex items-center justify-center gap-4 pt-2"
+            >
+              <button
+                type="button"
+                onClick={controller.playPrev}
+                aria-label="Previous track"
+                className="w-12 h-12 rounded-full border border-white/15 bg-white/[0.04] text-white/70 hover:text-white flex items-center justify-center cursor-pointer"
+              >
+                <SkipBack className="w-5 h-5" />
+              </button>
+
+              <button
+                type="button"
+                onClick={controller.togglePlayPause}
+                aria-label={controller.isPlaying ? 'Pause' : 'Play'}
+                className="w-14 h-14 rounded-full bg-rose-600/80 hover:bg-rose-600 text-white flex items-center justify-center cursor-pointer"
+              >
+                {controller.isPlaying ? (
+                  <Pause className="w-6 h-6 fill-current" />
+                ) : (
+                  <Play className="w-6 h-6 fill-current ml-0.5" />
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={controller.playNext}
+                aria-label="Next track"
+                className="w-12 h-12 rounded-full border border-white/15 bg-white/[0.04] text-white/70 hover:text-white flex items-center justify-center cursor-pointer"
+              >
+                <SkipForward className="w-5 h-5" />
+              </button>
+            </div>
+          </div>
+
+          <div className="text-center space-y-1">
+            <p className="text-xs font-medium text-white/45">
+              {unlockHint ? 'Tap once more to unlock screen' : 'Double-tap anywhere to unlock'}
+            </p>
+            <p className="text-[10px] text-white/25 max-w-xs">
+              AMOLED black screen keeps audio playing nonstop in your pocket without accidental taps.
+            </p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+interface MusicMiniBarProps {
+  controller: MusicController;
+  isOnline: boolean;
+  onOpenMusic: () => void;
+}
+
+export const MusicMiniBar: React.FC<MusicMiniBarProps> = ({
+  controller,
+  isOnline,
+  onOpenMusic,
+}) => {
+  const track = controller.activeTrack;
+  if (!track) return null;
+
+  const pct =
+    controller.duration > 0
+      ? Math.min(100, (controller.currentTime / controller.duration) * 100)
+      : 0;
+
+  return (
+    <div className="fixed bottom-16 md:bottom-5 right-3 sm:right-5 z-40 w-[calc(100vw-24px)] max-w-[380px] rounded-2xl border border-slate-200 dark:border-[#242A38] bg-white/95 dark:bg-[#13161D]/95 backdrop-blur-md shadow-2xl overflow-hidden">
+      <div className="h-1 w-full bg-slate-200 dark:bg-white/10">
+        <div className="h-full bg-rose-600 transition-[width] duration-200" style={{width: `${pct}%`}} />
+      </div>
+      <div className="p-2.5 flex items-center gap-2.5">
+        <button
+          type="button"
+          onClick={onOpenMusic}
+          className="flex items-center gap-2.5 min-w-0 flex-1 text-left cursor-pointer group"
+        >
+          <div className="w-14 aspect-video rounded-lg overflow-hidden bg-black shrink-0">
+            <CachedThumbnail
+              videoId={track.videoId}
+              alt={track.title}
+              isOnline={isOnline}
+              fit="contain"
+              className="w-full h-full"
+            />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-xs font-semibold text-slate-900 dark:text-white truncate group-hover:text-rose-500 transition-colors">
+              {track.title}
+            </div>
+            <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate font-mono tabular-nums">
+              {track.authorName} · {formatDuration(controller.currentTime)}
+            </div>
+          </div>
+        </button>
+
+        <div className="flex items-center gap-1 shrink-0">
+          <button
+            type="button"
+            onClick={controller.togglePlayPause}
+            aria-label={controller.isPlaying ? 'Pause audio' : 'Play audio'}
+            className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-rose-600 hover:bg-rose-700 text-white cursor-pointer"
+          >
+            {controller.isPlaying ? (
+              <Pause className="w-3.5 h-3.5" />
+            ) : (
+              <Play className="w-3.5 h-3.5" />
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={controller.playNext}
+            aria-label="Next audio track"
+            className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#1C212C] cursor-pointer"
+          >
+            <SkipForward className="w-3.5 h-3.5" />
+          </button>
+
+          <button
+            type="button"
+            onClick={controller.stopAndClear}
+            aria-label="Close music bar"
+            className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-400 hover:text-rose-500 cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
